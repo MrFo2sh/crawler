@@ -1,0 +1,6 @@
+# crawl output
+*.json
+
+# python
+__pycache__/
+*.pyc
