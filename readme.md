@@ -112,6 +112,9 @@ Results are de-duplicated and sorted before being written out.
 - Only parses `text/html` responses; other content types are recorded as
   links/assets but not crawled into.
 - Failed requests are skipped so one bad URL never stops the run.
+- Illegal filename characters in the target (e.g. the `:` in `host:port`) are
+  replaced with `_` in the default output filename; `tar_name` inside the JSON
+  keeps the real value.
 
 ## Educational use / authorization
 

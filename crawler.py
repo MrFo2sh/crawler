@@ -151,6 +151,11 @@ def crawl(start, max_pages):
     return {"tar_name": domain, "data": out}
 
 
+def safe_name(name):
+    """Make a netloc safe to use as a filename (e.g. host:port on Windows/HGFS)."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="crawler", description="Tiny dependency-free web crawler.")
     ap.add_argument("url", help="start URL, e.g. http://example.com")
@@ -161,7 +166,7 @@ def main():
     start = args.url if "://" in args.url else "http://" + args.url
     result = crawl(start, args.max_pages)
 
-    out_file = args.output or f"{result['tar_name']}.json"
+    out_file = args.output or safe_name(result["tar_name"]) + ".json"
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
