@@ -1,285 +1,167 @@
 #!/usr/bin/env python3
 """
-crawler - a tiny, dependency-free website crawler.
+crawler.py - a single-site reconnaissance spider built on Scrapy.
 
-Usage:
-    python crawler.py http://example.com
-    python crawler.py http://example.com -p 100 -o out.json
-    python crawler.py https://spa.example.com --render        # JS-rendered sites
+Give it a start URL and it walks the site (staying on the same host, ports
+included), collecting the intel a page exposes:
 
-By default it fetches raw HTML with the standard library (no deps). For
-JavaScript-rendered sites (React/Vue/Angular SPAs, where the real <form>s,
-<img>s and links are built in the browser and the served HTML is just an
-empty <div id="root">), pass --render to drive a headless browser instead,
-so the crawler parses the rendered DOM. --render needs Playwright:
+    emails . links . external files (css/pdf/doc/xls) . js files .
+    form field names . images . video sources . audio sources . html comments
 
-    pip install playwright && playwright install chromium
+Everything is de-duplicated and written to one JSON file.
 
-Crawls one website (staying on its domain), then writes everything it finds
-to a JSON file shaped like:
+Only dependency: Scrapy.
 
-    {
-      "tar_name": "example.com",
-      "data": {
-        "pages":          [...],   # HTML pages actually crawled
-        "links":          [...],   # every <a href> (on- and off-site)
-        "emails":         [...],
-        "phones":         [...],
-        "css":            [...],   # <link rel=stylesheet> / *.css
-        "js_files":       [...],   # <script src>
-        "external_files": [...],   # linked docs: pdf/doc(x)/xls(x) + non-text hits
-        "form_fields":    [...],   # names of every input/textarea/select
-        "images":         [...],   # <img src>
-        "videos":         [...],   # <video>/<source> src
-        "audio":          [...],   # <audio>/<source> src
-        "comments":       [...],   # <!-- ... -->
-        "forms":          [...]    # structured: action, method, inputs
-      }
-    }
+    pip install scrapy
+    python crawler.py https://example.com
+    python crawler.py https://example.com -o site.json
 
-Standard library only. No pip install needed (unless you opt into --render).
+Author:  Mohamed Fouad (MrFo2sh)
+License: MIT
 """
 
 import argparse
 import json
 import re
-import sys
-from collections import deque
-from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
-# --- patterns -------------------------------------------------------------
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-PHONE_RE = re.compile(r"\+?\d[\d\-\s().]{7,}\d")
-# linked documents worth pulling out separately (stops before any ?query/#frag)
-DOC_EXT_RE = re.compile(r"\.(css|pdf|docx?|xlsx?)(?:[?#]|$)", re.I)
-UA = "Mozilla/5.0 (compatible; crawler/1.0)"
+import scrapy
+from scrapy.crawler import CrawlerProcess
+from scrapy.downloadermiddlewares.offsite import OffsiteMiddleware
 
-# every bucket the crawler fills (sets, de-duplicated). "forms" is a list.
-SET_KEYS = ("pages", "links", "emails", "phones", "css", "js_files",
-            "external_files", "form_fields", "images", "videos", "audio",
-            "comments")
+# an email anywhere in the page body
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# linked documents we record but never crawl into
+DOCUMENT_RE = re.compile(r"\.(?:css|pdf|docx?|xlsx?)(?:[?#]|$)", re.IGNORECASE)
+# href schemes/anchors that are never crawlable pages
+SKIP_LINK_PREFIXES = ("mailto:", "tel:", "javascript:", "#")
 
 
-class Extractor(HTMLParser):
-    """Pulls links, assets, media, forms and comments out of one HTML page."""
-
-    def __init__(self, base):
-        super().__init__(convert_charrefs=True)
-        self.base = base
-        self.links = set()
-        self.css = set()
-        self.js_files = set()
-        self.external_files = set()
-        self.form_fields = set()
-        self.images = set()
-        self.videos = set()
-        self.audio = set()
-        self.comments = set()
-        self.forms = []
-        self._form = None      # currently-open <form> dict, or None
-        self._media = None     # "video" | "audio" | None — parent of a <source>
-
-    def _abs(self, url):
-        return urljoin(self.base, url)
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        href = a.get("href")
-        src = a.get("src")
-
-        if tag == "a" and href:
-            absu = self._abs(href)
-            self.links.add(absu)
-            if DOC_EXT_RE.search(href):
-                self.external_files.add(absu)
-        elif tag == "link" and href:
-            rel = (a.get("rel") or "").lower()
-            absu = self._abs(href)
-            if "stylesheet" in rel or href.split("?")[0].lower().endswith(".css"):
-                self.css.add(absu)
-            elif DOC_EXT_RE.search(href):
-                self.external_files.add(absu)
-        elif tag == "script" and src:
-            self.js_files.add(self._abs(src))
-        elif tag == "img" and src:
-            self.images.add(self._abs(src))
-        elif tag == "video":
-            self._media = "video"
-            if src:
-                self.videos.add(self._abs(src))
-        elif tag == "audio":
-            self._media = "audio"
-            if src:
-                self.audio.add(self._abs(src))
-        elif tag == "source" and src:
-            (self.audio if self._media == "audio" else self.videos).add(self._abs(src))
-        elif tag == "form":
-            self._form = {
-                "action": self._abs(a.get("action", "")),
-                "method": (a.get("method") or "get").lower(),
-                "inputs": [],
-            }
-        elif tag in ("input", "textarea", "select"):
-            name = a.get("name", "")
-            if name:
-                self.form_fields.add(name)
-            if self._form is not None:
-                self._form["inputs"].append({"name": name, "type": a.get("type", "text")})
-
-    def handle_startendtag(self, tag, attrs):
-        self.handle_starttag(tag, attrs)
-        if tag in ("video", "audio"):   # self-closing media tag holds no <source>
-            self._media = None
-
-    def handle_endtag(self, tag):
-        if tag == "form" and self._form is not None:
-            self.forms.append(self._form)
-            self._form = None
-        elif tag in ("video", "audio"):
-            self._media = None
-
-    def handle_comment(self, data):
-        text = data.strip()
-        if text:
-            self.comments.add(text)
+def hostname(url):
+    """Host without the port  (app.example.com:8080 -> app.example.com)."""
+    return urlparse(url).netloc.split(":")[0]
 
 
-def fetch(url):
-    """Return (html_text, content_type) or (None, content_type) on non-HTML/failure."""
-    try:
-        req = Request(url, headers={"User-Agent": UA})
-        with urlopen(req, timeout=10) as resp:
-            ctype = resp.headers.get_content_type()
-            if ctype != "text/html":
-                return None, ctype
-            charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.read().decode(charset, "replace"), ctype
-    except Exception as exc:  # noqa: BLE001 - keep the crawl going
-        print(f"  ! skip {url} ({exc})", file=sys.stderr)
-        return None, None
+class SameSiteOffsiteMiddleware(OffsiteMiddleware):
+    """Offsite filter that compares hostnames only, so a target served on a
+    non-default port (e.g. an app on :8080) is still treated as on-site."""
+
+    def should_follow(self, request, spider):
+        regex = getattr(self, "host_regex", None)
+        if not regex:                      # no allowed_domains -> allow all
+            return True
+        return bool(regex.search(hostname(request.url)))
 
 
-def make_renderer(wait_ms):
-    """Return (get_html, close) backed by a headless Chromium via Playwright.
+class SiteReconSpider(scrapy.Spider):
+    """Crawl one site and inventory what it links to and loads."""
 
-    get_html(url) navigates the browser to url, lets client-side JS run, and
-    returns (rendered_dom, None) — or (None, None) on failure. One browser is
-    launched and reused for the whole crawl. close() tears it down.
-    """
-    try:
-        from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
-    except ImportError:
-        sys.exit(
-            "error: --render needs Playwright. Install it with:\n"
-            "    pip install playwright && playwright install chromium"
-        )
+    name = "site_recon"
 
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True)
-    page = browser.new_page(user_agent=UA)
+    # bucket -> the selector(s) whose extracted URLs are absolutised into it
+    ASSET_SELECTORS = {
+        "js_files": ("script::attr(src)",),
+        "images": ("img::attr(src)",),
+        "videos": ("video::attr(src)", "video source::attr(src)"),
+        "audio": ("audio::attr(src)", "audio source::attr(src)"),
+    }
+    RESULT_KEYS = (
+        "emails", "links", "external_files", "js_files", "form_fields",
+        "images", "videos", "audio", "comments",
+    )
 
-    def get_html(url):
-        try:
-            # 'load' (not 'networkidle') — widgets like reCAPTCHA keep the
-            # network busy forever and would otherwise time out.
-            page.goto(url, wait_until="load", timeout=30000)
-            page.wait_for_timeout(wait_ms)  # let the SPA paint into #root
-            return page.content(), None
-        except Exception as exc:  # noqa: BLE001 - keep the crawl going
-            print(f"  ! skip {url} ({exc})", file=sys.stderr)
-            return None, None
+    def __init__(self, start_url, output="results.json", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_urls = [start_url]
+        self.allowed_domains = [hostname(start_url)]
+        self.output = output
+        self.seen = set()
+        self.results = {key: set() for key in self.RESULT_KEYS}
 
-    def close():
-        browser.close()
-        pw.stop()
+    # -- per-response extraction -------------------------------------------
 
-    return get_html, close
+    def parse(self, response):
+        self.seen.add(response.url)
 
+        content_type = response.headers.get("Content-Type", b"").decode("latin-1", "ignore")
+        if "text" not in content_type:
+            # a binary / document response: record the URL and stop here
+            self.results["external_files"].add(response.url)
+            return
 
-def crawl(start, max_pages, render=False, render_wait=2500):
-    domain = urlparse(start).netloc
-    seen, queue = set(), deque([start])
-    data = {k: set() for k in SET_KEYS}
-    forms = []
+        self._grab_intel(response)
+        self._grab_assets(response)
+        self._grab_forms(response)
+        self._grab_comments(response)
+        yield from self._grab_links(response)
 
-    if render:
-        get_html, close = make_renderer(render_wait)
-    else:
-        get_html, close = fetch, (lambda: None)
+    def _grab_intel(self, response):
+        self.results["emails"].update(EMAIL_RE.findall(response.text))
+        for href in response.css("a::attr(href), link::attr(href)").getall():
+            if DOCUMENT_RE.search(href):
+                self.results["external_files"].add(response.urljoin(href))
 
-    try:
-        while queue and len(data["pages"]) < max_pages:
-            url = queue.popleft()
-            if url in seen:
+    def _grab_assets(self, response):
+        for bucket, selectors in self.ASSET_SELECTORS.items():
+            for selector in selectors:
+                for url in response.css(selector).getall():
+                    self.results[bucket].add(response.urljoin(url))
+
+    def _grab_forms(self, response):
+        names = response.css(
+            "input::attr(name), textarea::attr(name), select::attr(name)"
+        ).getall()
+        self.results["form_fields"].update(name for name in names if name)
+
+    def _grab_comments(self, response):
+        for raw in response.xpath("//comment()").getall():
+            text = raw.strip("<!->").strip()
+            if text:
+                self.results["comments"].add(text)
+
+    def _grab_links(self, response):
+        here = hostname(response.url)
+        for href in response.css("a::attr(href)").getall():
+            if not href or href.startswith(SKIP_LINK_PREFIXES):
                 continue
-            seen.add(url)
+            url = response.urljoin(href)
+            self.results["links"].add(url)
+            if hostname(url) == here and url not in self.seen:
+                self.seen.add(url)
+                yield response.follow(url, callback=self.parse)
 
-            html, ctype = get_html(url)
-            if html is None:
-                # a reachable but non-text response (pdf, zip, ...) is still an asset
-                if ctype and not ctype.startswith("text"):
-                    data["external_files"].add(url)
-                continue
-            print(f"[+] {url}")
-            data["pages"].add(url)
+    # -- output ------------------------------------------------------------
 
-            ext = Extractor(url)
-            ext.feed(html)
-
-            data["links"].update(ext.links)
-            data["css"].update(ext.css)
-            data["js_files"].update(ext.js_files)
-            data["external_files"].update(ext.external_files)
-            data["form_fields"].update(ext.form_fields)
-            data["images"].update(ext.images)
-            data["videos"].update(ext.videos)
-            data["audio"].update(ext.audio)
-            data["comments"].update(ext.comments)
-            data["emails"].update(EMAIL_RE.findall(html))
-            data["phones"].update(p.strip() for p in PHONE_RE.findall(html))
-            forms.extend(ext.forms)
-
-            # queue new, same-domain, http(s) links
-            for link in ext.links:
-                p = urlparse(link)
-                if p.scheme in ("http", "https") and p.netloc == domain and link not in seen:
-                    queue.append(link)
-    finally:
-        close()
-
-    out = {k: sorted(v) for k, v in data.items()}
-    out["forms"] = forms
-    return {"tar_name": domain, "data": out}
+    def closed(self, reason):
+        report = {key: sorted(values) for key, values in self.results.items()}
+        with open(self.output, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=4, ensure_ascii=False)
+        summary = " | ".join(f"{k}:{len(v)}" for k, v in report.items())
+        self.logger.info("saved %s  (%s)", self.output, summary)
 
 
-def safe_name(name):
-    """Make a netloc safe to use as a filename (e.g. host:port on Windows/HGFS)."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+def crawl(start_url, output):
+    process = CrawlerProcess(settings={
+        "LOG_LEVEL": "INFO",
+        "DOWNLOADER_MIDDLEWARES": {
+            # swap the built-in offsite filter for our port-aware subclass
+            "scrapy.downloadermiddlewares.offsite.OffsiteMiddleware": None,
+            "__main__.SameSiteOffsiteMiddleware": 50,
+        },
+    })
+    process.crawl(SiteReconSpider, start_url=start_url, output=output)
+    process.start()
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="crawler", description="Tiny dependency-free web crawler.")
-    ap.add_argument("url", help="start URL, e.g. http://example.com")
-    ap.add_argument("-p", "--max-pages", type=int, default=50, help="max pages to crawl (default 50)")
-    ap.add_argument("-o", "--output", help="output JSON file (default <tar_name>.json)")
-    ap.add_argument("-r", "--render", action="store_true",
-                    help="drive a headless browser so JS-rendered SPAs are parsed (needs Playwright)")
-    ap.add_argument("--render-wait", type=int, default=2500, metavar="MS",
-                    help="ms to wait after load for the SPA to paint (default 2500; --render only)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(prog="crawler", description="Single-site recon spider (Scrapy).")
+    parser.add_argument("start_url", help="URL to start crawling, e.g. https://example.com")
+    parser.add_argument("-o", "--output", default="results.json",
+                        help="output JSON file (default results.json)")
+    args = parser.parse_args()
 
-    start = args.url if "://" in args.url else "http://" + args.url
-    result = crawl(start, args.max_pages, render=args.render, render_wait=args.render_wait)
-
-    out_file = args.output or safe_name(result["tar_name"]) + ".json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-
-    d = result["data"]
-    print(f"\n[done] {len(d['pages'])} pages -> {out_file}")
-    print("  " + " | ".join(f"{k}:{len(v)}" for k, v in d.items()))
+    start = args.start_url if "://" in args.start_url else "http://" + args.start_url
+    crawl(start, args.output)
 
 
 if __name__ == "__main__":
