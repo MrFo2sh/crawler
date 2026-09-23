@@ -4,3 +4,6 @@
 # python
 __pycache__/
 *.pyc
+
+# local playwright browser download (for --render); not part of the repo
+.ms-playwright/
