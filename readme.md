@@ -18,6 +18,21 @@ pip install scrapy
 pip install -r requirements.txt
 ```
 
+**On Kali / Debian** (Python is externally managed — a plain `pip install`
+raises `externally-managed-environment`), use the packaged Scrapy instead:
+
+```bash
+sudo apt install python3-scrapy      # system-wide, no venv needed
+```
+
+Or isolate it in a virtual environment:
+
+```bash
+python3 -m venv ~/.venvs/crawler
+source ~/.venvs/crawler/bin/activate
+pip install scrapy
+```
+
 ## Usage
 
 ```bash
