@@ -1,167 +1,178 @@
 #!/usr/bin/env python3
 """
-crawler.py - a single-site reconnaissance spider built on Scrapy.
+crawler - a tiny, dependency-free website crawler.
 
-Give it a start URL and it walks the site (staying on the same host, ports
-included), collecting the intel a page exposes:
+Usage:
+    python crawler.py http://example.com
+    python crawler.py http://example.com -p 100 -o out.json
 
-    emails . links . external files (css/pdf/doc/xls) . js files .
-    form field names . images . video sources . audio sources . html comments
+Crawls one website (staying on its domain), then writes everything it finds
+to a JSON file shaped like:
 
-Everything is de-duplicated and written to one JSON file.
+    {
+      "tar_name": "example.com",
+      "data": {
+        "pages":    [...],
+        "links":    [...],
+        "css":      [...],
+        "js":       [...],
+        "images":   [...],
+        "forms":    [...],
+        "emails":   [...],
+        "phones":   [...],
+        "comments": [...]
+      }
+    }
 
-Only dependency: Scrapy.
-
-    pip install scrapy
-    python crawler.py https://example.com
-    python crawler.py https://example.com -o site.json
-
-Author:  Mohamed Fouad (MrFo2sh)
-License: MIT
+Standard library only. No pip install needed.
 """
 
 import argparse
 import json
 import re
-from urllib.parse import urlparse
+import sys
+from collections import deque
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
-import scrapy
-from scrapy.crawler import CrawlerProcess
-from scrapy.downloadermiddlewares.offsite import OffsiteMiddleware
-
-# an email anywhere in the page body
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-# linked documents we record but never crawl into
-DOCUMENT_RE = re.compile(r"\.(?:css|pdf|docx?|xlsx?)(?:[?#]|$)", re.IGNORECASE)
-# href schemes/anchors that are never crawlable pages
-SKIP_LINK_PREFIXES = ("mailto:", "tel:", "javascript:", "#")
+# --- patterns -------------------------------------------------------------
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"\+?\d[\d\-\s().]{7,}\d")
+UA = "Mozilla/5.0 (compatible; crawler/1.0)"
 
 
-def hostname(url):
-    """Host without the port  (app.example.com:8080 -> app.example.com)."""
-    return urlparse(url).netloc.split(":")[0]
+class Extractor(HTMLParser):
+    """Pulls links, assets, forms and comments out of one HTML page."""
+
+    def __init__(self, base):
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.links, self.css, self.js, self.images = set(), set(), set(), set()
+        self.comments = set()
+        self.forms = []
+        self._form = None
+
+    def _abs(self, url):
+        return urljoin(self.base, url)
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "a" and a.get("href"):
+            self.links.add(self._abs(a["href"]))
+        elif tag == "link":
+            href = a.get("href")
+            rel = (a.get("rel") or "").lower()
+            if href and ("stylesheet" in rel or href.lower().endswith(".css")):
+                self.css.add(self._abs(href))
+        elif tag == "script" and a.get("src"):
+            self.js.add(self._abs(a["src"]))
+        elif tag == "img" and a.get("src"):
+            self.images.add(self._abs(a["src"]))
+        elif tag == "form":
+            self._form = {
+                "action": self._abs(a.get("action", "")),
+                "method": (a.get("method") or "get").lower(),
+                "inputs": [],
+            }
+        elif tag in ("input", "textarea", "select") and self._form is not None:
+            self._form["inputs"].append(
+                {"name": a.get("name", ""), "type": a.get("type", "text")}
+            )
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self._form is not None:
+            self.forms.append(self._form)
+            self._form = None
+
+    def handle_comment(self, data):
+        text = data.strip()
+        if text:
+            self.comments.add(text)
 
 
-class SameSiteOffsiteMiddleware(OffsiteMiddleware):
-    """Offsite filter that compares hostnames only, so a target served on a
-    non-default port (e.g. an app on :8080) is still treated as on-site."""
-
-    def should_follow(self, request, spider):
-        regex = getattr(self, "host_regex", None)
-        if not regex:                      # no allowed_domains -> allow all
-            return True
-        return bool(regex.search(hostname(request.url)))
-
-
-class SiteReconSpider(scrapy.Spider):
-    """Crawl one site and inventory what it links to and loads."""
-
-    name = "site_recon"
-
-    # bucket -> the selector(s) whose extracted URLs are absolutised into it
-    ASSET_SELECTORS = {
-        "js_files": ("script::attr(src)",),
-        "images": ("img::attr(src)",),
-        "videos": ("video::attr(src)", "video source::attr(src)"),
-        "audio": ("audio::attr(src)", "audio source::attr(src)"),
-    }
-    RESULT_KEYS = (
-        "emails", "links", "external_files", "js_files", "form_fields",
-        "images", "videos", "audio", "comments",
-    )
-
-    def __init__(self, start_url, output="results.json", *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.start_urls = [start_url]
-        self.allowed_domains = [hostname(start_url)]
-        self.output = output
-        self.seen = set()
-        self.results = {key: set() for key in self.RESULT_KEYS}
-
-    # -- per-response extraction -------------------------------------------
-
-    def parse(self, response):
-        self.seen.add(response.url)
-
-        content_type = response.headers.get("Content-Type", b"").decode("latin-1", "ignore")
-        if "text" not in content_type:
-            # a binary / document response: record the URL and stop here
-            self.results["external_files"].add(response.url)
-            return
-
-        self._grab_intel(response)
-        self._grab_assets(response)
-        self._grab_forms(response)
-        self._grab_comments(response)
-        yield from self._grab_links(response)
-
-    def _grab_intel(self, response):
-        self.results["emails"].update(EMAIL_RE.findall(response.text))
-        for href in response.css("a::attr(href), link::attr(href)").getall():
-            if DOCUMENT_RE.search(href):
-                self.results["external_files"].add(response.urljoin(href))
-
-    def _grab_assets(self, response):
-        for bucket, selectors in self.ASSET_SELECTORS.items():
-            for selector in selectors:
-                for url in response.css(selector).getall():
-                    self.results[bucket].add(response.urljoin(url))
-
-    def _grab_forms(self, response):
-        names = response.css(
-            "input::attr(name), textarea::attr(name), select::attr(name)"
-        ).getall()
-        self.results["form_fields"].update(name for name in names if name)
-
-    def _grab_comments(self, response):
-        for raw in response.xpath("//comment()").getall():
-            text = raw.strip("<!->").strip()
-            if text:
-                self.results["comments"].add(text)
-
-    def _grab_links(self, response):
-        here = hostname(response.url)
-        for href in response.css("a::attr(href)").getall():
-            if not href or href.startswith(SKIP_LINK_PREFIXES):
-                continue
-            url = response.urljoin(href)
-            self.results["links"].add(url)
-            if hostname(url) == here and url not in self.seen:
-                self.seen.add(url)
-                yield response.follow(url, callback=self.parse)
-
-    # -- output ------------------------------------------------------------
-
-    def closed(self, reason):
-        report = {key: sorted(values) for key, values in self.results.items()}
-        with open(self.output, "w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=4, ensure_ascii=False)
-        summary = " | ".join(f"{k}:{len(v)}" for k, v in report.items())
-        self.logger.info("saved %s  (%s)", self.output, summary)
+def fetch(url):
+    """Return (html_text, content_type) or (None, None) on any failure."""
+    try:
+        req = Request(url, headers={"User-Agent": UA})
+        with urlopen(req, timeout=10) as resp:
+            ctype = resp.headers.get_content_type()
+            if ctype != "text/html":
+                return None, ctype
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.read().decode(charset, "replace"), ctype
+    except Exception as exc:  # noqa: BLE001 - keep the crawl going
+        print(f"  ! skip {url} ({exc})", file=sys.stderr)
+        return None, None
 
 
-def crawl(start_url, output):
-    process = CrawlerProcess(settings={
-        "LOG_LEVEL": "INFO",
-        "DOWNLOADER_MIDDLEWARES": {
-            # swap the built-in offsite filter for our port-aware subclass
-            "scrapy.downloadermiddlewares.offsite.OffsiteMiddleware": None,
-            "__main__.SameSiteOffsiteMiddleware": 50,
-        },
-    })
-    process.crawl(SiteReconSpider, start_url=start_url, output=output)
-    process.start()
+def crawl(start, max_pages):
+    domain = urlparse(start).netloc
+    seen, queue = set(), deque([start])
+    data = {k: set() for k in ("pages", "links", "css", "js", "images",
+                               "emails", "phones", "comments")}
+    forms = []
+
+    while queue and len(data["pages"]) < max_pages:
+        url = queue.popleft()
+        if url in seen:
+            continue
+        seen.add(url)
+
+        html, _ = fetch(url)
+        if html is None:
+            continue
+        print(f"[+] {url}")
+        data["pages"].add(url)
+
+        ext = Extractor(url)
+        ext.feed(html)
+
+        data["links"].update(ext.links)
+        data["css"].update(ext.css)
+        data["js"].update(ext.js)
+        data["images"].update(ext.images)
+        data["comments"].update(ext.comments)
+        data["emails"].update(EMAIL_RE.findall(html))
+        data["phones"].update(p.strip() for p in PHONE_RE.findall(html))
+        forms.extend(ext.forms)
+
+        # queue new, same-domain, http(s) links
+        for link in ext.links:
+            p = urlparse(link)
+            if p.scheme in ("http", "https") and p.netloc == domain and link not in seen:
+                queue.append(link)
+
+    out = {k: sorted(v) for k, v in data.items()}
+    out["forms"] = forms
+    return {"tar_name": domain, "data": out}
+
+
+def safe_name(name):
+    """Make a netloc safe to use as a filename (e.g. host:port on Windows/HGFS)."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="crawler", description="Single-site recon spider (Scrapy).")
-    parser.add_argument("start_url", help="URL to start crawling, e.g. https://example.com")
-    parser.add_argument("-o", "--output", default="results.json",
-                        help="output JSON file (default results.json)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(prog="crawler", description="Tiny dependency-free web crawler.")
+    ap.add_argument("url", help="start URL, e.g. http://example.com")
+    ap.add_argument("-p", "--max-pages", type=int, default=50, help="max pages to crawl (default 50)")
+    ap.add_argument("-o", "--output", help="output JSON file (default <tar_name>.json)")
+    args = ap.parse_args()
 
-    start = args.start_url if "://" in args.start_url else "http://" + args.start_url
-    crawl(start, args.output)
+    start = args.url if "://" in args.url else "http://" + args.url
+    result = crawl(start, args.max_pages)
+
+    out_file = args.output or safe_name(result["tar_name"]) + ".json"
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    d = result["data"]
+    print(f"\n[done] {len(d['pages'])} pages -> {out_file}")
+    print("  " + " | ".join(f"{k}:{len(v)}" for k, v in d.items()))
 
 
 if __name__ == "__main__":
