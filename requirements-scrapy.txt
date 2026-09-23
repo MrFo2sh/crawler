@@ -1,0 +1,8 @@
+# Dependencies for the Scrapy variant (scrapy_recon.py).
+# crawler.py needs none of these — it is standard-library only.
+
+scrapy>=2.11
+
+# Optional: only needed for `scrapy_recon.py --render` (JavaScript rendering).
+# After installing, run once:  playwright install chromium
+scrapy-playwright>=0.0.40

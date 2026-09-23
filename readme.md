@@ -9,10 +9,16 @@ form structures — into one clean JSON file.
 
 Standard library only. No `pip install`, nothing to set up.
 
-> Same recon surface as HTB's Scrapy-based `ReconSpider`, but with **no
-> dependencies**. Scrapy, like this tool, only sees the server's raw HTML — so
-> for JavaScript-rendered SPAs use the optional [`--render`](#javascript-rendered-sites--render)
-> mode, which actually goes further than a plain Scrapy crawl.
+This repo ships **two** crawlers that produce the same JSON shape:
+
+| File | Engine | Dependencies | Best for |
+| :--- | :--- | :--- | :--- |
+| **`crawler.py`** | stdlib (`urllib` + `html.parser`) | none | quick, portable, drop-anywhere recon |
+| **`scrapy_recon.py`** | [Scrapy](https://scrapy.org) | `scrapy` (+ `scrapy-playwright` for `--render`) | larger crawls, concurrency, retries, robots, JS rendering |
+
+Both stay on one domain, both can render JavaScript for SPAs, and both write
+the same `{tar_name, data:{…}}` JSON — pick whichever fits the job. The Scrapy
+variant is documented [further down](#scrapy-variant-scrapy_reconpy).
 
 ## Requirements
 
@@ -164,6 +170,61 @@ Results are de-duplicated and sorted before being written out.
 - Illegal filename characters in the target (e.g. the `:` in `host:port`) are
   replaced with `_` in the default output filename; `tar_name` inside the JSON
   keeps the real value.
+
+## Scrapy variant (`scrapy_recon.py`)
+
+Same recon surface, built on the [Scrapy](https://scrapy.org) framework — so
+you get concurrency, retries, redirects, `robots.txt` support and a real
+scheduler for free. Useful when a target is large or you want polite,
+rate-limited crawling.
+
+Install and run:
+
+```bash
+pip install scrapy
+python scrapy_recon.py https://example.com
+```
+
+Options:
+
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `url` | Start URL (positional). | — |
+| `-p`, `--max-pages` | Max pages to crawl (`CLOSESPIDER_PAGECOUNT`). | `50` |
+| `-o`, `--output` | Output JSON file. | `<host>.json` |
+| `-r`, `--render` | Render JavaScript via scrapy-playwright (for SPAs). | off |
+| `--render-wait` | Ms to wait for the SPA to paint (`--render` only). | `2500` |
+| `--delay` | Seconds between requests (politeness). | `0` |
+| `--obey-robots` | Honour `robots.txt`. | off |
+| `--user-agent` | User-Agent header to send. | `recon-crawler/1.0` |
+
+### Rendering JavaScript with the Scrapy variant
+
+```bash
+pip install scrapy-playwright && playwright install chromium
+python scrapy_recon.py https://spa.example.com --render
+```
+
+`--render` routes every request through a headless Chromium (via
+scrapy-playwright) and parses the rendered DOM, so SPAs that ship an empty
+`<div id="root">` still yield their forms, images and links.
+
+### How it differs from a copy-paste spider
+
+`scrapy_recon.py` is a from-scratch implementation, not a fork of any tutorial
+spider. Notable design choices:
+
+- **No `OffsiteMiddleware` subclassing** — on-site scope (host **and** port) is
+  enforced in code, so `host:port` targets aren't dropped.
+- **`LinkExtractor` for page discovery** — it ignores image/CSS/JS/archive
+  extensions by default, so linked assets are never mistaken for pages (no
+  runaway `assets/img/…/assets/img/…` recursion).
+- **Structured forms** — each form is captured as `{action, method, inputs}`
+  with typed fields, in addition to a flat `form_fields` list.
+- **Correct media attribution** — a `<source>` is filed under its real
+  `<video>` or `<audio>` parent, not both.
+- **Cleaned comments** — `<!-- -->` markers stripped.
+- **Politeness built in** — `--delay`, `--obey-robots`, page cap.
 
 ## Educational use / authorization
 
