@@ -28,6 +28,7 @@ Options:
 | `-H`, `--header` | Extra request header, **curl style** (`"Name: value"`). Repeatable. See below. | — |
 | `-A`, `--user-agent` | User-Agent string (same as `-H "User-Agent: ..."`). | `Mozilla/5.0 (compatible; crawler/1.0)` |
 | `-b`, `--cookie` | Cookie header value (same as `-H "Cookie: ..."`). String form only, no cookie-jar files. | — |
+| `-k`, `--insecure` | Skip TLS certificate verification (like `curl -k`). | off |
 
 Examples:
 
@@ -56,6 +57,28 @@ like. The headers are sent with **every** request the crawler makes.
 Later flags win: `-A foo -H "User-Agent: bar"` sends `bar`. Header names are
 sent in `Title-Case` (`x-api-key` goes out as `X-Api-Key`), which is what
 `urllib` does; HTTP header names are case-insensitive so servers don't care.
+
+`Accept-Encoding` is always forced to `identity` (the crawler does not
+decompress responses), so any `Accept-Encoding` you pass is overridden.
+
+### Paste a Chrome "Copy as cURL" line
+
+You can grab a request in Chrome DevTools (**Network → right-click → Copy →
+Copy as cURL**) and run it through the crawler by just swapping `curl` for
+`crawler`:
+
+```bash
+crawler 'http://app.local:5000/' \
+  -H 'Accept: text/html,application/xhtml+xml' \
+  -b 'pid=0c3b...; sid=ca9d...' \
+  -H 'User-Agent: Mozilla/5.0 ...' \
+  --compressed --insecure
+```
+
+`-H`, `-b`, `-A` and `-k`/`--insecure` are honoured. Other curl-only flags
+(`--compressed`, `-L`/`--location`, `--data-raw`, `--http2`, …) are accepted
+and ignored with a one-line note on stderr, so the paste runs instead of
+erroring out.
 
 ### Type `crawler http://...` instead of `python crawler.py`
 

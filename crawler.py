@@ -6,6 +6,8 @@ Usage:
     python crawler.py http://example.com
     python crawler.py http://example.com -p 100 -o out.json
     python crawler.py http://example.com -H "Cookie: PHPSESSID=abc" -H "X-Forwarded-For: 127.0.0.1"
+    # paste a Chrome "Copy as cURL" line, just swap curl -> crawler:
+    python crawler.py 'https://example.com/' -H 'Accept: text/html' -b 'sid=...' --compressed -k
 
 Crawls one website (staying on its domain), then writes everything it finds
 to a JSON file shaped like:
@@ -31,21 +33,32 @@ Standard library only. No pip install needed.
 import argparse
 import json
 import re
+import ssl
 import sys
 from collections import deque
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, build_opener
+from urllib.request import HTTPSHandler, Request, build_opener
 
 # --- patterns -------------------------------------------------------------
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\-\s().]{7,}\d")
 UA = "Mozilla/5.0 (compatible; crawler/1.0)"
 
-# Opener with urllib's own default headers stripped, so only the headers we
-# decide on (see build_headers) go out on the wire.
-OPENER = build_opener()
-OPENER.addheaders = []
+
+def build_opener_for(insecure):
+    """An opener with urllib's own default headers stripped, so only the
+    headers we decide on (see build_headers) go out on the wire. With
+    `insecure` (curl's -k) it also skips TLS certificate verification."""
+    handlers = []
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        handlers.append(HTTPSHandler(context=ctx))
+    opener = build_opener(*handlers)
+    opener.addheaders = []
+    return opener
 
 
 def parse_header(raw, headers):
@@ -95,6 +108,8 @@ def build_headers(args):
         parse_header(f"Cookie: {args.cookie}", headers)
     for h in args.header or []:
         parse_header(h, headers)
+    # We don't decompress, so never let the server gzip/br the body on us.
+    parse_header("Accept-Encoding: identity", headers)
     return headers
 
 
@@ -150,11 +165,11 @@ class Extractor(HTMLParser):
             self.comments.add(text)
 
 
-def fetch(url, headers):
+def fetch(url, headers, opener):
     """Return (html_text, content_type) or (None, None) on any failure."""
     try:
         req = Request(url, headers=headers)
-        with OPENER.open(req, timeout=10) as resp:
+        with opener.open(req, timeout=10) as resp:
             ctype = resp.headers.get_content_type()
             if ctype != "text/html":
                 return None, ctype
@@ -165,7 +180,7 @@ def fetch(url, headers):
         return None, None
 
 
-def crawl(start, max_pages, headers):
+def crawl(start, max_pages, headers, opener):
     domain = urlparse(start).netloc
     seen, queue = set(), deque([start])
     data = {k: set() for k in ("pages", "links", "css", "js", "images",
@@ -178,7 +193,7 @@ def crawl(start, max_pages, headers):
             continue
         seen.add(url)
 
-        html, _ = fetch(url, headers)
+        html, _ = fetch(url, headers, opener)
         if html is None:
             continue
         print(f"[+] {url}")
@@ -225,11 +240,23 @@ def main():
                     help=f'User-Agent string (default "{UA}")')
     ap.add_argument("-b", "--cookie", metavar="DATA",
                     help='Cookie header value, e.g. "PHPSESSID=abc; lang=en"')
-    args = ap.parse_args()
+    # curl-compat flags, so a Chrome "Copy as cURL" line works by just
+    # swapping `curl` for `crawler`. -k is honoured; the rest are accepted
+    # and ignored, and any other unknown curl flag is ignored with a note.
+    ap.add_argument("-k", "--insecure", action="store_true",
+                    help="skip TLS certificate verification (like curl -k)")
+    ap.add_argument("--compressed", action="store_true",
+                    help=argparse.SUPPRESS)
+    ap.add_argument("-L", "--location", action="store_true",
+                    help=argparse.SUPPRESS)
+    args, ignored = ap.parse_known_args()
+    if ignored:
+        print(f"  ! ignoring curl-only options: {' '.join(ignored)}", file=sys.stderr)
 
     headers = build_headers(args)
+    opener = build_opener_for(args.insecure)
     start = args.url if "://" in args.url else "http://" + args.url
-    result = crawl(start, args.max_pages, headers)
+    result = crawl(start, args.max_pages, headers, opener)
 
     out_file = args.output or safe_name(result["tar_name"]) + ".json"
     with open(out_file, "w", encoding="utf-8") as f:
