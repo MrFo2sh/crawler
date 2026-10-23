@@ -25,6 +25,9 @@ Options:
 | `url` | Start URL (positional). `http://` is added if you omit the scheme. | — |
 | `-p`, `--max-pages` | Maximum number of pages to crawl. | `50` |
 | `-o`, `--output` | Output JSON file. | `<tar_name>.json` |
+| `-H`, `--header` | Extra request header, **curl style** (`"Name: value"`). Repeatable. See below. | — |
+| `-A`, `--user-agent` | User-Agent string (same as `-H "User-Agent: ..."`). | `Mozilla/5.0 (compatible; crawler/1.0)` |
+| `-b`, `--cookie` | Cookie header value (same as `-H "Cookie: ..."`). String form only, no cookie-jar files. | — |
 
 Examples:
 
@@ -32,7 +35,27 @@ Examples:
 python crawler.py example.com                 # crawl, write example.com.json
 python crawler.py http://example.com -p 100   # crawl up to 100 pages
 python crawler.py example.com -o site.json    # custom output file
+python crawler.py example.com -H "X-Forwarded-For: 127.0.0.1" -H "Authorization: Bearer eyJ..."
+python crawler.py example.com -b "PHPSESSID=abc123; lang=en"   # crawl as a logged-in user
+python crawler.py example.com -A "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0"
+python crawler.py example.com -H @headers.txt  # one "Name: value" per line
 ```
+
+### Headers (`-H`) — same rules as curl
+
+`-H` takes exactly what `curl -H` takes, and can be repeated as often as you
+like. The headers are sent with **every** request the crawler makes.
+
+| Form | Effect | Example |
+| :--- | :--- | :--- |
+| `"Name: value"` | Set the header (replaces any existing one with that name, case-insensitive). | `-H "X-Forwarded-For: 127.0.0.1"` |
+| `"Name;"` | Send the header with an **empty** value. | `-H "X-Custom;"` |
+| `"Name:"` | **Remove** the header, including the default `User-Agent`. | `-H "User-Agent:"` |
+| `"@file"` | Read headers from a file, one per line (each line follows the rules above). | `-H @burp-headers.txt` |
+
+Later flags win: `-A foo -H "User-Agent: bar"` sends `bar`. Header names are
+sent in `Title-Case` (`x-api-key` goes out as `X-Api-Key`), which is what
+`urllib` does; HTTP header names are case-insensitive so servers don't care.
 
 ### Type `crawler http://...` instead of `python crawler.py`
 
@@ -98,7 +121,8 @@ results:
 
 `crawler.py` uses only the Python standard library:
 
-- `urllib` fetches pages (with a timeout and a User-Agent).
+- `urllib` fetches pages (with a timeout and the headers built from
+  `-H` / `-A` / `-b`, defaulting to just a User-Agent).
 - `html.parser` extracts tags, attributes, forms and comments.
 - `re` finds emails and phone numbers.
 - A simple queue keeps the crawl on the target's domain and stops at

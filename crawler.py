@@ -5,6 +5,7 @@ crawler - a tiny, dependency-free website crawler.
 Usage:
     python crawler.py http://example.com
     python crawler.py http://example.com -p 100 -o out.json
+    python crawler.py http://example.com -H "Cookie: PHPSESSID=abc" -H "X-Forwarded-For: 127.0.0.1"
 
 Crawls one website (staying on its domain), then writes everything it finds
 to a JSON file shaped like:
@@ -34,12 +35,67 @@ import sys
 from collections import deque
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener
 
 # --- patterns -------------------------------------------------------------
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\-\s().]{7,}\d")
 UA = "Mozilla/5.0 (compatible; crawler/1.0)"
+
+# Opener with urllib's own default headers stripped, so only the headers we
+# decide on (see build_headers) go out on the wire.
+OPENER = build_opener()
+OPENER.addheaders = []
+
+
+def parse_header(raw, headers):
+    """Apply one curl-style -H value to the `headers` dict (case-insensitive).
+
+    Mirrors curl's rules:
+        "Name: value"  -> set the header
+        "Name;"        -> send the header with an empty value
+        "Name:"        -> remove the header entirely (even a default one)
+        "@file"        -> read one header per line from a file
+    """
+    raw = raw.strip()
+    if not raw:
+        return
+    if raw.startswith("@"):
+        with open(raw[1:], encoding="utf-8") as f:
+            for line in f:
+                parse_header(line.rstrip("\r\n"), headers)
+        return
+
+    if raw.endswith(";") and ":" not in raw:
+        name, value = raw[:-1].strip(), ""
+    elif ":" in raw:
+        name, value = raw.split(":", 1)
+        name, value = name.strip(), value.strip()
+        if value == "":
+            value = None  # curl: "Name:" means "do not send this header"
+    else:
+        print(f"  ! ignoring malformed header {raw!r} (expected 'Name: value')", file=sys.stderr)
+        return
+
+    if not name:
+        return
+    # drop any existing header with the same name regardless of case
+    for k in [k for k in headers if k.lower() == name.lower()]:
+        del headers[k]
+    if value is not None:
+        headers[name] = value
+
+
+def build_headers(args):
+    """Merge defaults with -A / -b / -H the way curl does (later flags win)."""
+    headers = {"User-Agent": UA}
+    if args.user_agent is not None:
+        parse_header(f"User-Agent: {args.user_agent}", headers)
+    if args.cookie is not None:
+        parse_header(f"Cookie: {args.cookie}", headers)
+    for h in args.header or []:
+        parse_header(h, headers)
+    return headers
 
 
 class Extractor(HTMLParser):
@@ -94,11 +150,11 @@ class Extractor(HTMLParser):
             self.comments.add(text)
 
 
-def fetch(url):
+def fetch(url, headers):
     """Return (html_text, content_type) or (None, None) on any failure."""
     try:
-        req = Request(url, headers={"User-Agent": UA})
-        with urlopen(req, timeout=10) as resp:
+        req = Request(url, headers=headers)
+        with OPENER.open(req, timeout=10) as resp:
             ctype = resp.headers.get_content_type()
             if ctype != "text/html":
                 return None, ctype
@@ -109,7 +165,7 @@ def fetch(url):
         return None, None
 
 
-def crawl(start, max_pages):
+def crawl(start, max_pages, headers):
     domain = urlparse(start).netloc
     seen, queue = set(), deque([start])
     data = {k: set() for k in ("pages", "links", "css", "js", "images",
@@ -122,7 +178,7 @@ def crawl(start, max_pages):
             continue
         seen.add(url)
 
-        html, _ = fetch(url)
+        html, _ = fetch(url, headers)
         if html is None:
             continue
         print(f"[+] {url}")
@@ -161,10 +217,19 @@ def main():
     ap.add_argument("url", help="start URL, e.g. http://example.com")
     ap.add_argument("-p", "--max-pages", type=int, default=50, help="max pages to crawl (default 50)")
     ap.add_argument("-o", "--output", help="output JSON file (default <tar_name>.json)")
+    ap.add_argument("-H", "--header", action="append", metavar="HEADER",
+                    help='extra request header, curl style: "Name: value" (repeatable). '
+                         '"Name;" sends an empty value, "Name:" removes a header, '
+                         '"@file" reads one header per line from a file')
+    ap.add_argument("-A", "--user-agent", metavar="UA",
+                    help=f'User-Agent string (default "{UA}")')
+    ap.add_argument("-b", "--cookie", metavar="DATA",
+                    help='Cookie header value, e.g. "PHPSESSID=abc; lang=en"')
     args = ap.parse_args()
 
+    headers = build_headers(args)
     start = args.url if "://" in args.url else "http://" + args.url
-    result = crawl(start, args.max_pages)
+    result = crawl(start, args.max_pages, headers)
 
     out_file = args.output or safe_name(result["tar_name"]) + ".json"
     with open(out_file, "w", encoding="utf-8") as f:
